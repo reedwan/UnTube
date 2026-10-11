@@ -1,0 +1,61 @@
+# Local private directories (kept locally, not published to public extension repo)
+app/
+tools/
+app_data/
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+env/
+venv/
+ENV/
+.venv/
+*/.venv/
+
+# PyInstaller & Build outputs
+build/
+dist/
+distributions/
+*.spec
+
+# Model checkpoints & auxiliary weights (preserves main production fastenhancer_m.onnx)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx.data
+assets/fastenhancer_m_*.onnx
+
+# Media & Archives
+media/
+*.log
+*.zip
+*.tar.gz
+*.crx
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.aac
+
+# OS / System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+.ropeproject/

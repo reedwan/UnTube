@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "UnTube",
+  "version": "1.0.8",
+  "description": "Real-time speech isolation",
+  "action": {
+    "default_title": "UnTube",
+    "default_icon": {
+      "16": "icons/icon16_off.png",
+      "32": "icons/icon32_off.png",
+      "48": "icons/icon48_off.png",
+      "128": "icons/icon128_off.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "tabCapture",
+    "activeTab",
+    "tabs",
+    "storage",
+    "offscreen",
+    "scripting"
+  ],
+  "commands": {
+    "toggle_filter": {
+      "suggested_key": {
+        "default": "Alt+Shift+U",
+        "mac": "Command+Shift+U"
+      },
+      "description": "Toggle speech isolation on the current tab"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
