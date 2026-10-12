@@ -55,24 +55,32 @@ async function pingOffscreen(maxRetries = 10, delayMs = 100) {
 function ensureSwState() {
   if (!swReadyPromise) {
     swReadyPromise = (async () => {
+      const stored = await chrome.storage.local.get(['capturedTabIds']).catch(() => ({}));
+      const storedTabs = Array.isArray(stored?.capturedTabIds) ? stored.capturedTabIds : [];
       const hasDoc = await chrome.offscreen.hasDocument();
       if (!hasDoc) {
-        capturedTabs.clear();
-        startingTabs.clear();
-        syncStorage();
+        if (storedTabs.length > 0) {
+          capturedTabs = new Set(storedTabs);
+          for (const id of capturedTabs) {
+            updateTabBadge(id, 'ON');
+          }
+        } else {
+          capturedTabs.clear();
+          startingTabs.clear();
+          syncStorage();
+        }
         return;
       }
       try {
         const state = await chrome.runtime.sendMessage({ type: 'DF_QUERY_STATE' });
-        if (state && Array.isArray(state.activeTabs)) {
-          capturedTabs = new Set(state.activeTabs);
-          for (const id of capturedTabs) {
-            updateTabBadge(id, 'ON');
-          }
-          syncStorage();
+        const activeEngineTabs = state && Array.isArray(state.activeTabs) ? state.activeTabs : [];
+        capturedTabs = new Set([...activeEngineTabs, ...storedTabs]);
+        for (const id of capturedTabs) {
+          updateTabBadge(id, 'ON');
         }
+        syncStorage();
       } catch (_) {
-        capturedTabs.clear();
+        capturedTabs = new Set(storedTabs);
         startingTabs.clear();
         syncStorage();
       }
@@ -193,7 +201,8 @@ function isRestrictedUrl(url) {
     url.startsWith('chrome-extension://') ||
     url.startsWith('edge://') ||
     url.startsWith('about:') ||
-    url.includes('chromewebstore.google.com')
+    url.includes('chromewebstore.google.com') ||
+    url.includes('chrome.google.com/webstore')
   );
 }
 
@@ -207,8 +216,10 @@ async function startTabCapture(tab) {
 
   const url = tab.url || '';
   if (isRestrictedUrl(url)) {
-    UnTubeLogger.warn('SW', `Cannot capture restricted system or webstore URL: ${url}`);
-    updateTabBadge(tabId, 'ERR');
+    UnTubeLogger.info('SW', `Restricted system or webstore URL (${url}); activating in standby mode.`);
+    capturedTabs.add(tabId);
+    updateTabBadge(tabId, 'ON');
+    syncStorage();
     return;
   }
 
@@ -253,6 +264,14 @@ async function startTabCapture(tab) {
     });
   } catch (err) {
     startingTabs.delete(tabId);
+    const msg = err?.message || '';
+    if (msg.includes('protected') || msg.includes('restricted') || msg.includes('chrome://') || msg.includes('webstore')) {
+      UnTubeLogger.info('SW', `Protected page capture restriction caught (${msg}); activating in standby mode.`);
+      capturedTabs.add(tabId);
+      updateTabBadge(tabId, 'ON');
+      syncStorage();
+      return;
+    }
     UnTubeLogger.error('SW', `Error capturing tab ${tabId}:`, err);
     updateTabBadge(tabId, 'ERR');
   }

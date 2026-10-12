@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "UnTube",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Real-time speech isolation",
   "action": {
     "default_title": "UnTube",
