@@ -67,6 +67,8 @@ UnTube runs a custom causal recurrent neural network based on FastEnhancer-M (`a
 4. Click **Load unpacked** and select the repository directory.
 5. Pin **UnTube** to the browser toolbar.
 
+> **Note:** Requires desktop Chromium (like Chrome, Edge and Opera). Audio manipulation is not supported on mobile browsers.
+
 ---
 
 ## Controls
