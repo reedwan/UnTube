@@ -265,8 +265,8 @@ async function startTabCapture(tab) {
   } catch (err) {
     startingTabs.delete(tabId);
     const msg = err?.message || '';
-    if (msg.includes('protected') || msg.includes('restricted') || msg.includes('chrome://') || msg.includes('webstore')) {
-      UnTubeLogger.info('SW', `Protected page capture restriction caught (${msg}); activating in standby mode.`);
+    if (msg.includes('protected') || msg.includes('restricted') || msg.includes('chrome://') || msg.includes('webstore') || msg.includes('file')) {
+      UnTubeLogger.info('SW', `Protected page or ungranted file capture restriction caught (${msg}); activating in standby mode.`);
       capturedTabs.add(tabId);
       updateTabBadge(tabId, 'ON');
       syncStorage();
