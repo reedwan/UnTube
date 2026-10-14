@@ -5,11 +5,11 @@
 'use strict';
 
 
-const DEBUG = false;
-
 const UnTubeLogger = {
+  DEBUG: false,
+
   info(tag, ...args) {
-    if (!DEBUG) return;
+    if (!this.DEBUG) return;
     console.log(`[UnTube] [${tag}]`, ...args);
   },
 

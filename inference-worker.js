@@ -19,17 +19,15 @@
 
 const EXTENSION_BASE_URL = self.location.origin + '/';
 const ORT_BASE_URL = EXTENSION_BASE_URL + 'assets/vendor/onnxruntime-web/';
-const CHANNEL_COUNT = 2;
 const SAMPLE_RATE = 48000;
 const HOP_SIZE = 320; // 6.67 ms at 48 kHz
-const STEREO_HOP = HOP_SIZE * CHANNEL_COUNT; // 640 floats
 
 // Load ONNX Runtime Web WASM distribution
 importScripts(ORT_BASE_URL + 'ort.wasm.min.js');
 
 // Configure ONNX Runtime Web for low-latency real-time audio inference
 ort.env.wasm.numThreads = 1;
-ort.env.wasm.simd = true;
+ort.env.wasm.simd = 'relaxed';
 ort.env.wasm.proxy = false;
 ort.env.wasm.wasmPaths = {
   mjs: ORT_BASE_URL + 'ort-wasm-simd-threaded.mjs',
@@ -44,9 +42,8 @@ let workletPort = null;
 let isProcessing = false;
 let isSwitching = false;
 
-// Single persistent recurrent cache buffer set:
-// Pre-allocated once at init; in-place .set() eliminates 13.3 MB/s of heap churn
-// without ping-pong complexity.
+// Persistent recurrent cache feed map:
+// Updated each hop via zero-copy tensor reference binding.
 let cacheTensors = null;
 let feeds = null;
 const inputBuffer = new Float32Array(HOP_SIZE);
@@ -83,8 +80,8 @@ function getTensorDims(meta) {
 }
 
 /**
- * Reset all recurrent states and allocate persistent cache tensors.
- * Pre-allocates a static feeds object so session.run() performs zero object allocations.
+ * Reset all recurrent states and allocate initial cache tensors.
+ * Pre-allocates a static feeds object so session.run() performs zero feed object allocations.
  */
 function resetChannelStates() {
   if (!session) return;
@@ -108,41 +105,40 @@ function resetChannelStates() {
 }
 
 /**
- * Execute single-hop neural inference on downmixed audio frame.
- * Operates with zero JS heap allocations by updating recurrent caches in-place.
+ * Execute single-hop neural inference on mono audio frame.
+ * Binds output cache tensors directly into feeds to eliminate 13.3 MB/s of memcpy overhead.
  * @returns {Promise<Float32Array>} Enhanced audio frame of HOP_SIZE samples.
  */
 async function processChannelFastEnhancer() {
   const results = await session.run(feeds);
   const enhancedData = results.wav_out?.data || emptyWavOut;
 
-  // In-place update of recurrent hidden state tensors for next hop
+  // Zero-copy pointer swap of recurrent hidden state tensors for next hop
   for (let i = 0; i < cacheOutputNames.length; i++) {
-    const outData = results[cacheOutputNames[i]].data;
-    cacheTensors[i].data.set(outData);
+    feeds[cacheInputNames[i]] = results[cacheOutputNames[i]];
   }
 
   return enhancedData;
 }
 
 /**
- * Process a single incoming stereo buffer received from the AudioWorklet.
- * @param {ArrayBuffer} stereoBuffer - Interleaved stereo Float32Array buffer.
+ * Process a single incoming mono buffer received from the AudioWorklet.
+ * @param {ArrayBuffer} monoBuffer - Mono Float32Array buffer of HOP_SIZE samples.
  */
-async function handleIncomingAudio(stereoBuffer) {
+async function handleIncomingAudio(monoBuffer) {
   if (!session || !workletPort || isSwitching) return;
   const tStart = DEBUG ? performance.now() : 0;
 
-  const stereoInput = new Float32Array(stereoBuffer);
-  if (stereoInput.length < STEREO_HOP) return;
+  const monoIO = new Float32Array(monoBuffer);
+  if (monoIO.length < HOP_SIZE) return;
 
-  // 1. Mono downmix & digital silence detection
+  // 1. Copy mono frame via native SIMD memcpy & detect digital silence with early exit
+  inputBuffer.set(monoIO.length === HOP_SIZE ? monoIO : monoIO.subarray(0, HOP_SIZE));
   let isSilent = true;
-  for (let i = 0, idx = 0; i < HOP_SIZE; i++, idx += 2) {
-    const mono = 0.5 * (stereoInput[idx] + stereoInput[idx + 1]);
-    inputBuffer[i] = mono;
-    if (Math.abs(mono) > SILENCE_THRESHOLD) {
+  for (let i = 0; i < HOP_SIZE; i++) {
+    if (Math.abs(monoIO[i]) > SILENCE_THRESHOLD) {
       isSilent = false;
+      break;
     }
   }
 
@@ -152,11 +148,6 @@ async function handleIncomingAudio(stereoBuffer) {
     consecutiveSilentHops++;
     if (consecutiveSilentHops > SILENCE_DECAY_HOPS) {
       // Audio stream is paused: skip inference entirely to drop CPU to ~0.0%
-      if (consecutiveSilentHops === SILENCE_DECAY_HOPS + 1 && cacheTensors) {
-        for (let i = 0; i < cacheTensors.length; i++) {
-          cacheTensors[i].data.fill(0);
-        }
-      }
       enhanced = emptyWavOut;
     } else {
       // Natural tail decay: run inference for first 15 hops (~100 ms) to let recurrent state decay
@@ -167,20 +158,18 @@ async function handleIncomingAudio(stereoBuffer) {
     enhanced = await processChannelFastEnhancer();
   }
 
-  // 3. Interleave enhanced audio back into dual-mono stereo output with branchless clamp
-  const stereoOutput = new Float32Array(STEREO_HOP);
-  for (let i = 0, idx = 0; i < HOP_SIZE; i++, idx += 2) {
+  // 3. Write enhanced mono audio in-place into monoIO buffer with clamp (zero heap allocation)
+  for (let i = 0; i < HOP_SIZE; i++) {
     let s = enhanced[i];
     if (s > 1.0) s = 1.0;
     else if (s < -1.0) s = -1.0;
-    stereoOutput[idx] = s;
-    stereoOutput[idx + 1] = s;
+    monoIO[i] = s;
   }
 
-  // 4. Transfer processed buffer back to AudioWorklet (zero-copy transfer)
+  // 4. Transfer processed mono buffer back to AudioWorklet (recycled into worklet pool)
   workletPort.postMessage(
-    { type: 'FILTERED', buffer: stereoOutput.buffer },
-    [stereoOutput.buffer]
+    { type: 'FILTERED', buffer: monoIO.buffer },
+    [monoIO.buffer]
   );
 
   // 5. Performance telemetry calculation (only active when DEBUG = true)

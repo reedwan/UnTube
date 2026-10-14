@@ -71,11 +71,11 @@ UnTube runs a custom causal recurrent neural network based on FastEnhancer-M (`a
 
 ## Controls
 
-Click the toolbar icon or press `Option+Shift+U` (macOS) / `Alt+Shift+U` (Windows/Linux) to toggle speech isolation on the active tab.
+Click the toolbar icon or press `Command+Shift+U` (macOS) / `Alt+Shift+U` (Windows/Linux) to toggle speech isolation on the active tab.
 
 The toolbar icon indicates extension status: **Grey** (inactive / standby), **Amber** (initializing audio pipeline, ~150 ms), or **Red** (active speech isolation).
 
-When toggled off, or when the active tab navigates or closes, all audio tracks are released and the background offscreen document is closed.
+When toggled off, or when the captured tab closes, all audio tracks are released and the background offscreen document is closed.
 
 ---
 

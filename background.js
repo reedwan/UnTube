@@ -17,11 +17,17 @@ importScripts('logger.js');
 // Set of currently captured tab IDs (e.g. Set of active tab numbers)
 let capturedTabs = new Set();
 
+// Set of restricted/system tab IDs activated in standby mode
+let standbyTabs = new Set();
+
 // Set of tab IDs currently negotiating capture initiation
 const startingTabs = new Set();
 
 // Lock set to debounce rapid double-clicks on the toolbar icon or shortcut
 const pendingToggles = new Set();
+
+// Active timeout handles for temporary 'ERR' badges per tab
+const errBadgeTimers = new Map();
 
 // Singleton promise for offscreen document creation
 let creatingOffscreenPromise = null;
@@ -49,38 +55,51 @@ async function pingOffscreen(maxRetries = 10, delayMs = 100) {
 }
 
 /**
+ * Filters a list of tab IDs to only those that still exist in the browser.
+ */
+async function filterExistingTabs(tabIds) {
+  const valid = [];
+  for (const id of tabIds) {
+    try {
+      const tab = await chrome.tabs.get(id);
+      if (tab) valid.push(id);
+    } catch (_) {}
+  }
+  return valid;
+}
+
+/**
  * Restores service worker state from the offscreen audio engine document.
  * Crucial in Manifest V3 where the service worker is terminated during idle audio playback.
  */
 function ensureSwState() {
   if (!swReadyPromise) {
     swReadyPromise = (async () => {
-      const stored = await chrome.storage.local.get(['capturedTabIds']).catch(() => ({}));
-      const storedTabs = Array.isArray(stored?.capturedTabIds) ? stored.capturedTabIds : [];
+      const stored = await chrome.storage.local.get(['standbyTabIds']).catch(() => ({}));
+      const rawStandby = Array.isArray(stored?.standbyTabIds) ? stored.standbyTabIds : [];
+      const validStandby = await filterExistingTabs(rawStandby);
+      standbyTabs = new Set(validStandby);
+
       const hasDoc = await chrome.offscreen.hasDocument();
       if (!hasDoc) {
-        if (storedTabs.length > 0) {
-          capturedTabs = new Set(storedTabs);
-          for (const id of capturedTabs) {
-            updateTabBadge(id, 'ON');
-          }
-        } else {
-          capturedTabs.clear();
-          startingTabs.clear();
-          syncStorage();
+        capturedTabs = new Set(standbyTabs);
+        startingTabs.clear();
+        for (const id of capturedTabs) {
+          updateTabBadge(id, 'ON');
         }
+        syncStorage();
         return;
       }
       try {
         const state = await chrome.runtime.sendMessage({ type: 'DF_QUERY_STATE' });
         const activeEngineTabs = state && Array.isArray(state.activeTabs) ? state.activeTabs : [];
-        capturedTabs = new Set([...activeEngineTabs, ...storedTabs]);
+        capturedTabs = new Set([...activeEngineTabs, ...standbyTabs]);
         for (const id of capturedTabs) {
           updateTabBadge(id, 'ON');
         }
         syncStorage();
       } catch (_) {
-        capturedTabs = new Set(storedTabs);
+        capturedTabs = new Set(standbyTabs);
         startingTabs.clear();
         syncStorage();
       }
@@ -112,8 +131,12 @@ async function ensureOffscreen() {
           }
         }
         UnTubeLogger.info('SW', 'Offscreen document created, awaiting handshake...');
-        await pingOffscreen();
-        UnTubeLogger.info('SW', 'Offscreen document ready.');
+        const ready = await pingOffscreen();
+        if (!ready) {
+          UnTubeLogger.warn('SW', 'Offscreen document handshake timed out.');
+        } else {
+          UnTubeLogger.info('SW', 'Offscreen document ready.');
+        }
       })().finally(() => {
         creatingOffscreenPromise = null;
       });
@@ -151,29 +174,36 @@ const ICONS_INACTIVE = {
  * - 'OFF': Grey icon, tooltip 'UnTube'.
  */
 function updateTabBadge(tabId, state) {
+  if (errBadgeTimers.has(tabId)) {
+    clearTimeout(errBadgeTimers.get(tabId));
+    errBadgeTimers.delete(tabId);
+  }
 
   if (state === 'ON') {
     chrome.action.setIcon({ tabId, path: ICONS_ACTIVE }).catch(() => {});
-    chrome.action.setBadgeText({ tabId, text: '' });
-    chrome.action.setTitle({ tabId, title: 'UnTube (Active)' });
+    chrome.action.setBadgeText({ tabId, text: '' }).catch(() => {});
+    chrome.action.setTitle({ tabId, title: 'UnTube (Active)' }).catch(() => {});
   } else if (state === 'STARTING') {
     chrome.action.setIcon({ tabId, path: ICONS_STARTING }).catch(() => {});
-    chrome.action.setBadgeText({ tabId, text: '' });
-    chrome.action.setTitle({ tabId, title: 'UnTube (Starting...)' });
+    chrome.action.setBadgeText({ tabId, text: '' }).catch(() => {});
+    chrome.action.setTitle({ tabId, title: 'UnTube (Starting...)' }).catch(() => {});
   } else if (state === 'ERR') {
-
     chrome.action.setIcon({ tabId, path: ICONS_INACTIVE }).catch(() => {});
-    chrome.action.setBadgeText({ tabId, text: 'ERR' });
-    chrome.action.setBadgeBackgroundColor({ tabId, color: '#ff5e97' });
-    chrome.action.setTitle({ tabId, title: 'UnTube (Cannot capture page)' });
-    setTimeout(() => {
-      chrome.action.setBadgeText({ tabId, text: '' });
-      chrome.action.setTitle({ tabId, title: 'UnTube' });
+    chrome.action.setBadgeText({ tabId, text: 'ERR' }).catch(() => {});
+    chrome.action.setBadgeBackgroundColor({ tabId, color: '#ff5e97' }).catch(() => {});
+    chrome.action.setTitle({ tabId, title: 'UnTube (Cannot capture page)' }).catch(() => {});
+    const timer = setTimeout(() => {
+      errBadgeTimers.delete(tabId);
+      if (!capturedTabs.has(tabId) && !startingTabs.has(tabId)) {
+        chrome.action.setBadgeText({ tabId, text: '' }).catch(() => {});
+        chrome.action.setTitle({ tabId, title: 'UnTube' }).catch(() => {});
+      }
     }, 2500);
+    errBadgeTimers.set(tabId, timer);
   } else {
     chrome.action.setIcon({ tabId, path: ICONS_INACTIVE }).catch(() => {});
-    chrome.action.setBadgeText({ tabId, text: '' });
-    chrome.action.setTitle({ tabId, title: 'UnTube' });
+    chrome.action.setBadgeText({ tabId, text: '' }).catch(() => {});
+    chrome.action.setTitle({ tabId, title: 'UnTube' }).catch(() => {});
   }
 }
 
@@ -184,6 +214,7 @@ function updateTabBadge(tabId, state) {
 function syncStorage() {
   chrome.storage.local.set({
     capturedTabIds: Array.from(capturedTabs),
+    standbyTabIds: Array.from(standbyTabs),
     isFiltering: capturedTabs.size > 0,
     selectedModel: ACTIVE_MODEL_KEY,
     gateMode: ACTIVE_GATE_MODE
@@ -217,6 +248,7 @@ async function startTabCapture(tab) {
   const url = tab.url || '';
   if (isRestrictedUrl(url)) {
     UnTubeLogger.info('SW', `Restricted system or webstore URL (${url}); activating in standby mode.`);
+    standbyTabs.add(tabId);
     capturedTabs.add(tabId);
     updateTabBadge(tabId, 'ON');
     syncStorage();
@@ -267,6 +299,7 @@ async function startTabCapture(tab) {
     const msg = err?.message || '';
     if (msg.includes('protected') || msg.includes('restricted') || msg.includes('chrome://') || msg.includes('webstore') || msg.includes('file')) {
       UnTubeLogger.info('SW', `Protected page or ungranted file capture restriction caught (${msg}); activating in standby mode.`);
+      standbyTabs.add(tabId);
       capturedTabs.add(tabId);
       updateTabBadge(tabId, 'ON');
       syncStorage();
@@ -283,6 +316,7 @@ async function startTabCapture(tab) {
 async function stopTabCapture(tabId) {
   UnTubeLogger.info('SW', `Stopping capture for tab ${tabId}`);
   startingTabs.delete(tabId);
+  standbyTabs.delete(tabId);
   capturedTabs.delete(tabId);
   updateTabBadge(tabId, 'OFF');
   syncStorage();
@@ -339,21 +373,48 @@ chrome.commands.onCommand.addListener(async (command) => {
 
 // Auto-cleanup if captured tab is closed by the user
 chrome.tabs.onRemoved.addListener((tabId) => {
+  if (errBadgeTimers.has(tabId)) {
+    clearTimeout(errBadgeTimers.get(tabId));
+    errBadgeTimers.delete(tabId);
+  }
   if (capturedTabs.has(tabId) || startingTabs.has(tabId)) {
     stopTabCapture(tabId).catch(() => {});
   }
 });
 
-// Auto-cleanup if captured tab navigates to a new webpage
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'loading' && (capturedTabs.has(tabId) || startingTabs.has(tabId))) {
-    UnTubeLogger.info('SW', `Captured tab ${tabId} navigating to new URL. Releasing stream.`);
-    stopTabCapture(tabId).catch(() => {});
+// Persist capture across URL navigations within the same tab
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  await ensureSwState().catch(() => {});
+  if (!capturedTabs.has(tabId) && !startingTabs.has(tabId)) return;
+
+  // If the tab was only in restricted-page standby mode (no audio stream), reset on navigation
+  if (standbyTabs.has(tabId)) {
+    if (changeInfo.status === 'loading') {
+      stopTabCapture(tabId).catch(() => {});
+    }
+    return;
+  }
+
+  if (changeInfo.status === 'loading') {
+    if (capturedTabs.has(tabId)) {
+      updateTabBadge(tabId, 'ON');
+    } else if (startingTabs.has(tabId)) {
+      updateTabBadge(tabId, 'STARTING');
+    }
+  } else if (changeInfo.status === 'complete' && capturedTabs.has(tabId)) {
+    updateTabBadge(tabId, 'ON');
+    if (!isRestrictedUrl(tab?.url || '')) {
+      chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['content.js']
+      }).catch(() => {});
+    }
   }
 });
 
 // Sync badge when the user switches browser tabs
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
+  await ensureSwState().catch(() => {});
   const tabId = activeInfo.tabId;
   if (capturedTabs.has(tabId)) {
     updateTabBadge(tabId, 'ON');
@@ -371,14 +432,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     UnTubeLogger.info('SW', `Tab ${msg.tabId} engine status: ${msg.state}`, msg.error || '');
     startingTabs.delete(msg.tabId);
     if (msg.state === 'active') {
+      standbyTabs.delete(msg.tabId);
       capturedTabs.add(msg.tabId);
       updateTabBadge(msg.tabId, 'ON');
       syncStorage();
     } else if (msg.state === 'stopped') {
+      standbyTabs.delete(msg.tabId);
       capturedTabs.delete(msg.tabId);
       updateTabBadge(msg.tabId, 'OFF');
       syncStorage();
     } else if (msg.state === 'error') {
+      standbyTabs.delete(msg.tabId);
       capturedTabs.delete(msg.tabId);
       updateTabBadge(msg.tabId, 'ERR');
       syncStorage();
@@ -389,9 +453,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Engine shutdown notification
   if (msg.type === 'DF_STATUS' && msg.state === 'stopped') {
     for (const id of capturedTabs) {
-      updateTabBadge(id, 'OFF');
+      if (!standbyTabs.has(id)) {
+        updateTabBadge(id, 'OFF');
+      }
     }
-    capturedTabs.clear();
+    capturedTabs = new Set(standbyTabs);
     startingTabs.clear();
     syncStorage();
     if (chrome.offscreen?.closeDocument) {
@@ -401,8 +467,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
 
-  // Fullscreen support bridge from content.js
-  if (msg.type === 'ENTER_FULLSCREEN' && sender.tab?.windowId) {
+  // Fullscreen support bridge from content.js (only active while tab is captured)
+  if (msg.type === 'ENTER_FULLSCREEN' && sender.tab?.windowId && sender.tab?.id && capturedTabs.has(sender.tab.id)) {
     const winId = sender.tab.windowId;
     chrome.windows.get(winId, (win) => {
       if (!win || win.state === 'fullscreen') return;
@@ -411,10 +477,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return false;
   }
-  if (msg.type === 'EXIT_FULLSCREEN' && sender.tab?.windowId) {
+  if (msg.type === 'EXIT_FULLSCREEN' && sender.tab?.windowId && sender.tab?.id && capturedTabs.has(sender.tab.id)) {
     const winId = sender.tab.windowId;
     chrome.storage.local.get([`winState_${winId}`], (res) => {
-      const prevState = (res && res[`winState_${winId}`]) || 'maximized';
+      const prevState = (res && res[`winState_${winId}`]) || 'normal';
+      chrome.storage.local.remove([`winState_${winId}`]).catch(() => {});
       chrome.windows.update(winId, { state: prevState }).catch(() => {});
     });
     return false;

@@ -64,6 +64,9 @@ let currentGateMode = 'normal'; // Fixed default: 'normal' = Smooth De-Bleed Sof
 
 // Registry of actively captured tabs: tabId -> { stream, sourceNode }
 const tabStreams = new Map();
+// Registry of tabs currently initializing capture: tabId -> generation counter
+const startingTabGenerations = new Map();
+let nextGeneration = 1;
 
 /**
  * Dispatches tab-specific status notifications to the background service worker.
@@ -113,16 +116,18 @@ async function ensureEngine() {
   initPromise = (async () => {
     UnTubeLogger.info('OFFSCREEN', `Initializing neural engine with model: ${MODEL_CONFIG.name}...`);
 
-    // 1. Fetch ONNX model binary
+    // 1. Start fetching ONNX model binary immediately
     const modelUrl = chrome.runtime.getURL(MODEL_CONFIG.file);
-    const modelRes = await fetch(modelUrl);
-    if (!modelRes.ok) {
-      throw new Error(`Failed to load ONNX model binary (${modelRes.status} ${modelRes.statusText})`);
-    }
-    const modelBuffer = await modelRes.arrayBuffer();
-    UnTubeLogger.info('OFFSCREEN', `Model binary loaded (${(modelBuffer.byteLength / 1024).toFixed(1)} KB)`);
+    const modelBufferPromise = fetch(modelUrl).then(async (modelRes) => {
+      if (!modelRes.ok) {
+        throw new Error(`Failed to load ONNX model binary (${modelRes.status} ${modelRes.statusText})`);
+      }
+      const buf = await modelRes.arrayBuffer();
+      UnTubeLogger.info('OFFSCREEN', `Model binary loaded (${(buf.byteLength / 1024).toFixed(1)} KB)`);
+      return buf;
+    });
 
-    // 2. Initialize 48kHz interactive AudioContext with auto-resume on device/system interruption
+    // 2. Initialize 48kHz interactive AudioContext & load AudioWorklet module concurrently
     audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: 'interactive' });
     audioCtx.onstatechange = () => {
       UnTubeLogger.info('OFFSCREEN', `AudioContext state changed: ${audioCtx?.state}`);
@@ -130,24 +135,33 @@ async function ensureEngine() {
         audioCtx.resume().catch(() => {});
       }
     };
-    if (audioCtx.state === 'suspended') {
-      await audioCtx.resume();
-    }
+    const resumePromise = audioCtx.state === 'suspended' ? audioCtx.resume() : Promise.resolve();
+    const workletModulePromise = audioCtx.audioWorklet.addModule(WORKLET_URL);
 
-    // 3. Launch dedicated WebAssembly ONNX inference worker
+    // 3. Launch dedicated WebAssembly ONNX inference worker in parallel (pre-loads ort.wasm.min.js)
     activeWorker = new Worker(WORKER_URL);
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Inference worker init timed out (15s)')), 15000);
+    const workerReadyPromise = new Promise((resolve, reject) => {
+      let settled = false;
+      const timeout = setTimeout(() => {
+        settled = true;
+        reject(new Error('Inference worker init timed out (15s)'));
+      }, 15000);
 
       activeWorker.onmessage = (e) => {
         const data = e.data || {};
         if (data.type === 'READY') {
+          settled = true;
           clearTimeout(timeout);
           UnTubeLogger.info('OFFSCREEN', `Neural inference worker READY (${MODEL_CONFIG.name}).`);
           resolve();
         } else if (data.type === 'ERROR') {
-          clearTimeout(timeout);
-          reject(new Error(data.error || 'Worker initialization failed'));
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            reject(new Error(data.error || 'Worker initialization failed'));
+          } else {
+            UnTubeLogger.error('OFFSCREEN', 'Runtime inference worker error:', data.error);
+          }
         } else if (data.type === 'STATS') {
           UnTubeLogger.info(
             'OFFSCREEN',
@@ -157,24 +171,40 @@ async function ensureEngine() {
       };
 
       activeWorker.onerror = (e) => {
-        clearTimeout(timeout);
-        reject(new Error(`Worker thread error: ${e.message}`));
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(new Error(`Worker thread error: ${e.message}`));
+        } else {
+          UnTubeLogger.error('OFFSCREEN', `Worker thread error: ${e.message}`);
+        }
       };
 
-      // Transfer model binary buffer ownership to the worker thread
-      activeWorker.postMessage(
-        {
-          command: 'init',
-          modelBuffer,
-          modelType: MODEL_CONFIG.type,
-          hopSize: MODEL_CONFIG.hopSize
-        },
-        [modelBuffer]
-      );
+      modelBufferPromise
+        .then((modelBuffer) => {
+          if (settled || !activeWorker) return;
+          // Transfer model binary buffer ownership to the worker thread once fetched
+          activeWorker.postMessage(
+            {
+              command: 'init',
+              modelBuffer,
+              modelType: MODEL_CONFIG.type,
+              hopSize: MODEL_CONFIG.hopSize
+            },
+            [modelBuffer]
+          );
+        })
+        .catch((err) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            reject(err);
+          }
+        });
     });
 
-    // 4. Load real-time AudioWorklet processor module
-    await audioCtx.audioWorklet.addModule(WORKLET_URL);
+    // 4. Wait for Worker session, AudioWorklet module, and AudioContext resume in parallel
+    await Promise.all([workerReadyPromise, workletModulePromise, resumePromise]);
     workletNode = new AudioWorkletNode(audioCtx, 'untube-audio-processor', {
       numberOfInputs: 1,
       numberOfOutputs: 1,
@@ -244,12 +274,24 @@ async function ensureEngine() {
 async function startTabPipeline(streamId, tabId) {
   UnTubeLogger.info('OFFSCREEN', `Connecting audio stream for tab ${tabId} (streamId=${streamId})`);
 
+  const gen = nextGeneration++;
+  startingTabGenerations.set(tabId, gen);
+
   try {
     if (tabStreams.has(tabId)) {
       stopTabPipeline(tabId, false);
+      startingTabGenerations.set(tabId, gen);
     }
 
     await ensureEngine();
+
+    // Abort if cancelled while awaiting engine initialization
+    if (startingTabGenerations.get(tabId) !== gen) {
+      if (tabStreams.size === 0 && startingTabGenerations.size === 0) {
+        shutdownEngine();
+      }
+      return;
+    }
 
     // Acquire MediaStream from tabCapture streamId token
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -259,16 +301,21 @@ async function startTabPipeline(streamId, tabId) {
           chromeMediaSourceId: streamId
         }
       },
-      video: {
-        mandatory: {
-          chromeMediaSource: 'tab',
-          chromeMediaSourceId: streamId
-        }
-      }
+      video: false
     });
 
-    // Terminate unused video track immediately to conserve resources
-    stream.getVideoTracks().forEach(t => t.stop());
+    // Abort and release stream if cancelled while awaiting getUserMedia
+    if (startingTabGenerations.get(tabId) !== gen || !audioCtx || !highpassNode) {
+      stream.getTracks().forEach(t => {
+        try { t.stop(); } catch (_) {}
+      });
+      if (tabStreams.size === 0 && startingTabGenerations.size === 0) {
+        shutdownEngine();
+      }
+      return;
+    }
+
+    startingTabGenerations.delete(tabId);
 
     // Connect tab audio stream source to the engine's high-pass filter input
     const sourceNode = audioCtx.createMediaStreamSource(stream);
@@ -286,9 +333,15 @@ async function startTabPipeline(streamId, tabId) {
     UnTubeLogger.info('OFFSCREEN', `Tab ${tabId} connected. Active filtered tabs: ${tabStreams.size}`);
     sendTabStatus('active', tabId);
   } catch (err) {
+    const wasCurrent = startingTabGenerations.get(tabId) === gen;
+    if (wasCurrent) {
+      startingTabGenerations.delete(tabId);
+    }
     UnTubeLogger.error('OFFSCREEN', `Failed to start pipeline for tab ${tabId}:`, err);
     stopTabPipeline(tabId);
-    sendTabStatus('error', tabId, { error: err.message || String(err) });
+    if (wasCurrent) {
+      sendTabStatus('error', tabId, { error: err.message || String(err) });
+    }
   }
 }
 
@@ -297,7 +350,9 @@ async function startTabPipeline(streamId, tabId) {
  * Automatically triggers engine shutdown if no tabs remain captured.
  */
 function stopTabPipeline(tabId, shouldShutdownIfEmpty = true) {
-  if (!tabStreams.has(tabId)) return;
+  const wasStarting = startingTabGenerations.delete(tabId);
+  const hasActive = tabStreams.has(tabId);
+  if (!hasActive && !wasStarting) return;
   UnTubeLogger.info('OFFSCREEN', `Disconnecting tab ${tabId}...`);
 
   const entry = tabStreams.get(tabId);
@@ -314,8 +369,8 @@ function stopTabPipeline(tabId, shouldShutdownIfEmpty = true) {
 
   sendTabStatus('stopped', tabId);
 
-  // Shut down engine if no captured tabs remain
-  if (shouldShutdownIfEmpty && tabStreams.size === 0) {
+  // Shut down engine if no captured or starting tabs remain
+  if (shouldShutdownIfEmpty && tabStreams.size === 0 && startingTabGenerations.size === 0) {
     shutdownEngine();
   }
 }
@@ -327,6 +382,7 @@ async function shutdownEngine() {
 
   UnTubeLogger.info('OFFSCREEN', 'Shutting down neural audio engine...');
   isEngineReady = false;
+  startingTabGenerations.clear();
 
   for (const [id, entry] of tabStreams.entries()) {
     try { entry.sourceNode.disconnect(); } catch (_) {}
@@ -379,11 +435,14 @@ async function shutdownEngine() {
   }
 
   if (audioCtx) {
-    try { await audioCtx.close(); } catch (_) {}
+    const ctxToClose = audioCtx;
     audioCtx = null;
+    try { await ctxToClose.close(); } catch (_) {}
   }
 
-  sendEngineStatus('stopped');
+  if (!initPromise && !isEngineReady && tabStreams.size === 0 && startingTabGenerations.size === 0) {
+    sendEngineStatus('stopped');
+  }
 }
 
 // Service worker IPC message routing

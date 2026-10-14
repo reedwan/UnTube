@@ -21,10 +21,12 @@
 
 'use strict';
 
-const CHANNELS = 2;
-// 16,384 samples = 8,192 stereo frames (~170.6 ms at 48 kHz). Power-of-two for bitwise masking.
 const QUEUE_CAPACITY = 16384;
 const QUEUE_MASK = QUEUE_CAPACITY - 1;
+
+// Silence short-circuit: stop waking the Worker thread after 15 silent hops (~100 ms)
+const SILENCE_THRESHOLD = 1e-5;
+const SILENCE_DECAY_HOPS = 15;
 
 class UnTubeAudioProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -34,19 +36,24 @@ class UnTubeAudioProcessor extends AudioWorkletProcessor {
     this.isBuffering = true;
     this.consecutiveUnderruns = 0;
 
-    // FastEnhancer-M standard frame hop: 320 samples per channel (6.67 ms at 48 kHz)
+    // FastEnhancer-M standard frame hop: 320 mono samples (6.67 ms at 48 kHz)
     this.hopSize = 320;
-    this.stereoHop = this.hopSize * CHANNELS; // 640 floats
 
     // Pre-buffer threshold: 6 hops (~40 ms at 48 kHz) provides a robust safety margin
     // against thread scheduling jitter while maintaining low perceived latency.
-    this.preBufferSamples = this.stereoHop * 6; // 3840 floats
+    this.preBufferSamples = this.hopSize * 6; // 1920 mono floats
 
-    // Input staging accumulator (interleaved stereo: L0, R0, L1, R1, ...)
-    this.inputAccumulator = new Float32Array(QUEUE_CAPACITY);
+    // Input staging accumulator (downmixed mono samples)
+    this.inputAccumulator = new Float32Array(this.hopSize);
     this.accumCount = 0;
+    this.currentHopSilent = true;
+    this.silentHops = SILENCE_DECAY_HOPS + 1;
+    this.isSleepingSilence = true;
 
-    // Output circular ring buffer
+    // Pool of recycled ArrayBuffers returned from InferenceWorker for zero-allocation transfers
+    this.bufferPool = [];
+
+    // Output circular ring buffer (16,384 mono samples = ~341.3 ms at 48 kHz)
     this.outputRing = new Float32Array(QUEUE_CAPACITY);
     this.ringWrite = 0;
     this.ringRead = 0;
@@ -91,10 +98,13 @@ class UnTubeAudioProcessor extends AudioWorkletProcessor {
    * @param {number} newHopSize - Samples per channel per neural inference hop.
    */
   setHopSize(newHopSize) {
-    if (!newHopSize || newHopSize <= 0) return;
+    if (!newHopSize || newHopSize <= 0 || newHopSize === this.hopSize) return;
     this.hopSize = newHopSize;
-    this.stereoHop = this.hopSize * CHANNELS;
-    this.preBufferSamples = this.stereoHop * 6;
+    this.preBufferSamples = this.hopSize * 6;
+    if (this.inputAccumulator.length !== this.hopSize) {
+      this.inputAccumulator = new Float32Array(this.hopSize);
+    }
+    this.bufferPool.length = 0;
     this._reset();
   }
 
@@ -105,6 +115,9 @@ class UnTubeAudioProcessor extends AudioWorkletProcessor {
     this.isBuffering = true;
     this.consecutiveUnderruns = 0;
     this.accumCount = 0;
+    this.currentHopSilent = true;
+    this.silentHops = SILENCE_DECAY_HOPS + 1;
+    this.isSleepingSilence = true;
     this.ringWrite = 0;
     this.ringRead = 0;
     this.ringAvailable = 0;
@@ -115,7 +128,7 @@ class UnTubeAudioProcessor extends AudioWorkletProcessor {
   }
 
   /**
-   * Handle incoming neural-filtered audio from InferenceWorker via dedicated port.
+   * Handle incoming neural-filtered mono audio from InferenceWorker via dedicated port.
    * @param {Object} data - Contains transferable Float32Array buffer.
    */
   _onFilteredFrame(data) {
@@ -123,7 +136,7 @@ class UnTubeAudioProcessor extends AudioWorkletProcessor {
     const incoming = new Float32Array(data.buffer);
     const count = incoming.length;
 
-    // Fast-path: Enqueue incoming samples using native SIMD memcpy (TypedArray.prototype.set)
+    // Fast-path: Enqueue incoming mono samples using native SIMD memcpy (TypedArray.prototype.set)
     const firstChunk = QUEUE_CAPACITY - this.ringWrite;
     if (firstChunk >= count) {
       this.outputRing.set(incoming, this.ringWrite);
@@ -135,11 +148,16 @@ class UnTubeAudioProcessor extends AudioWorkletProcessor {
     }
     this.ringAvailable = Math.min(QUEUE_CAPACITY, this.ringAvailable + count);
 
+    // Recycle transferred ArrayBuffer for subsequent outbound hops (zero-GC ping-pong pool)
+    if (count === this.hopSize && this.bufferPool.length < 8) {
+      this.bufferPool.push(data.buffer);
+    }
+
     // Latency bounding: prevent unbounded drift if the worker experienced an OS hitch
-    // Drop excess older samples if buffer exceeds 75% capacity (~128 ms).
+    // Drop excess older samples if buffer exceeds 75% capacity.
     const maxFill = Math.floor(QUEUE_CAPACITY * 0.75);
     if (this.ringAvailable > maxFill) {
-      const drop = Math.floor((this.ringAvailable - this.preBufferSamples) / CHANNELS) * CHANNELS;
+      const drop = this.ringAvailable - this.preBufferSamples;
       this.ringRead = (this.ringRead + drop) & QUEUE_MASK;
       this.ringAvailable -= drop;
     }
@@ -172,78 +190,107 @@ class UnTubeAudioProcessor extends AudioWorkletProcessor {
     const quantumLen = leftIn.length; // Always 128 samples in standard Web Audio
 
     // -------------------------------------------------------------------------
-    // 1. Stage incoming samples into the input accumulator
+    // 1. Downmix to mono once & stage incoming samples into input accumulator
     // -------------------------------------------------------------------------
-    // The write index is derived from the frame counter on every iteration (rather than
-    // carried as a separate strided pointer) so it can never drift out of sync with `acc`
-    // when a hop boundary falls in the middle of a 128-sample quantum.
     let acc = this.accumCount;
+    let hopSilent = this.currentHopSilent;
     for (let i = 0; i < quantumLen; i++) {
-      const idx = acc * CHANNELS;
-      this.inputAccumulator[idx] = leftIn[i];
-      this.inputAccumulator[idx + 1] = rightIn[i];
+      const mono = 0.5 * (leftIn[i] + rightIn[i]);
+      this.inputAccumulator[acc] = mono;
+      if (hopSilent && Math.abs(mono) > SILENCE_THRESHOLD) {
+        hopSilent = false;
+      }
       acc++;
 
       // When a complete neural frame (hopSize) has been staged, dispatch to worker
       if (acc >= this.hopSize) {
-        if (this.workerPort) {
-          // Slice a fresh Float32Array to transfer zero-copy ownership to worker thread
-          const transferCopy = new Float32Array(this.inputAccumulator.subarray(0, this.stereoHop));
+        if (hopSilent) {
+          this.silentHops++;
+        } else {
+          const wasSkippingSilentHops = this.silentHops > SILENCE_DECAY_HOPS;
+          this.silentHops = 0;
+          if (this.isSleepingSilence) {
+            // Wake from silence sleep: prime pre-buffer with silence so audio starts without underrun
+            this.outputRing.fill(0, 0, this.preBufferSamples);
+            this.ringRead = 0;
+            this.ringWrite = this.preBufferSamples & QUEUE_MASK;
+            this.ringAvailable = this.preBufferSamples;
+            this.isBuffering = false;
+            this.consecutiveUnderruns = 0;
+            this.isSleepingSilence = false;
+          } else if (wasSkippingSilentHops && this.ringAvailable < this.preBufferSamples) {
+            // Speech resumed while decayed tail was still draining: restore full pre-buffer cushion
+            const pad = this.preBufferSamples - this.ringAvailable;
+            const firstPad = QUEUE_CAPACITY - this.ringWrite;
+            if (firstPad >= pad) {
+              this.outputRing.fill(0, this.ringWrite, this.ringWrite + pad);
+              this.ringWrite = (this.ringWrite + pad) & QUEUE_MASK;
+            } else {
+              this.outputRing.fill(0, this.ringWrite, QUEUE_CAPACITY);
+              this.outputRing.fill(0, 0, pad - firstPad);
+              this.ringWrite = pad - firstPad;
+            }
+            this.ringAvailable = this.preBufferSamples;
+          }
+        }
+
+        // Only wake the Worker during active audio or the 15-hop (~100 ms) recurrent tail decay
+        if (this.workerPort && this.silentHops <= SILENCE_DECAY_HOPS) {
+          // Reuse a pooled ArrayBuffer when available to avoid real-time thread GC
+          const recycledBuf = this.bufferPool.pop();
+          const transferView =
+            recycledBuf && recycledBuf.byteLength === this.hopSize * 4
+              ? new Float32Array(recycledBuf)
+              : new Float32Array(this.hopSize);
+          transferView.set(this.inputAccumulator);
           this.workerPort.postMessage(
-            { type: 'PROCESS', buffer: transferCopy.buffer },
-            [transferCopy.buffer]
+            { type: 'PROCESS', buffer: transferView.buffer },
+            [transferView.buffer]
           );
         }
         acc = 0;
+        hopSilent = true;
       }
     }
     this.accumCount = acc;
+    this.currentHopSilent = hopSilent;
 
     // -------------------------------------------------------------------------
-    // 2. Playback: Read neural-filtered samples from output ring buffer
+    // 2. Playback: Read neural-filtered mono samples from output ring buffer
     // -------------------------------------------------------------------------
-    const neededSamples = quantumLen * CHANNELS; // 256 samples (128 stereo frames)
-
-    // Emit silence while pre-buffering
-    if (this.isBuffering) {
+    // Fast-path when sleeping during extended silence: 0 worker wakeups, direct zero output
+    if (this.isSleepingSilence || this.isBuffering) {
       leftOut.fill(0);
       if (rightOut) rightOut.fill(0);
       return true;
     }
 
-    if (this.ringAvailable >= neededSamples) {
-      // Dequeue stereo samples with register-cached pointer
-      let r = this.ringRead;
-      const ring = this.outputRing;
-      if (rightOut) {
-        for (let i = 0; i < quantumLen; i++) {
-          leftOut[i] = ring[r];
-          r = (r + 1) & QUEUE_MASK;
-          rightOut[i] = ring[r];
-          r = (r + 1) & QUEUE_MASK;
-        }
+    if (this.ringAvailable >= quantumLen) {
+      // Dequeue mono samples directly into leftOut using native SIMD TypedArray.set
+      const firstRead = QUEUE_CAPACITY - this.ringRead;
+      if (firstRead >= quantumLen) {
+        leftOut.set(this.outputRing.subarray(this.ringRead, this.ringRead + quantumLen));
+        this.ringRead = (this.ringRead + quantumLen) & QUEUE_MASK;
       } else {
-        for (let i = 0; i < quantumLen; i++) {
-          leftOut[i] = ring[r];
-          r = (r + 2) & QUEUE_MASK;
-        }
+        leftOut.set(this.outputRing.subarray(this.ringRead, QUEUE_CAPACITY));
+        leftOut.set(this.outputRing.subarray(0, quantumLen - firstRead), firstRead);
+        this.ringRead = quantumLen - firstRead;
       }
-      this.ringRead = r;
-      this.ringAvailable -= neededSamples;
+      this.ringAvailable -= quantumLen;
       this.consecutiveUnderruns = 0;
 
-      // 3. Soft Expander
+      // 3. Soft Expander (computed on mono leftOut channel before mirroring to rightOut)
       if (this.gateMode !== 'off') {
 
         const tHigh = this.gateMode === 'aggressive' ? 0.026 : 0.018;
         const tLow  = this.gateMode === 'aggressive' ? 0.009 : 0.005;
         const floor = this.gateMode === 'aggressive' ? 0.008 : 0.025;
 
-        // Calculate Root-Mean-Square (RMS) energy across current quantum
+        // Calculate Root-Mean-Square (RMS) energy across current mono quantum
         let sumSq = 0;
         for (let i = 0; i < quantumLen; i++) {
-          const mono = rightOut ? 0.5 * (leftOut[i] + rightOut[i]) : leftOut[i];
-          sumSq += mono * mono;
+          const m = leftOut[i];
+          sumSq += m * m;
         }
         let rms = Math.sqrt(sumSq / quantumLen);
         if (!Number.isFinite(rms)) {
@@ -278,28 +325,37 @@ class UnTubeAudioProcessor extends AudioWorkletProcessor {
         if (targetGain === 1.0 && gStart === 1.0) {
           // Zero compute needed
         } else if (Math.abs(deltaG) < 1e-4) {
-          // Constant noise-floor gain: simple linear multiply without polynomial
+          // Constant noise-floor gain: single-channel linear multiply
           for (let i = 0; i < quantumLen; i++) {
             leftOut[i] *= targetGain;
-            if (rightOut) rightOut[i] *= targetGain;
           }
           this.expanderGain = targetGain;
         } else {
-          // Active transition: apply C1-continuous sample-by-sample Hermite S-curve
+          // Active transition: interpolate smoothly per-sample across the 128-sample quantum
+          const step = deltaG / quantumLen;
           for (let i = 0; i < quantumLen; i++) {
-            const x = i / quantumLen;
-            const sCurve = x * x * (3.0 - 2.0 * x);
-            const g = gStart + deltaG * sCurve;
-            leftOut[i] *= g;
-            if (rightOut) {
-              rightOut[i] *= g;
-            }
+            leftOut[i] *= gStart + step * i;
           }
           this.expanderGain = targetGain;
         }
       }
+
+      // Mirror processed mono frame into right channel via native SIMD memcpy
+      if (rightOut) {
+        rightOut.set(leftOut);
+      }
+    } else if (this.silentHops > SILENCE_DECAY_HOPS) {
+      // Decayed tail has finished playing out: enter silence sleep (0 worker messages/sec)
+      leftOut.fill(0);
+      if (rightOut) rightOut.fill(0);
+      this.ringRead = 0;
+      this.ringWrite = 0;
+      this.ringAvailable = 0;
+      this.expanderEnv = 0.0;
+      this.expanderGain = this.gateMode === 'aggressive' ? 0.008 : 0.025;
+      this.isSleepingSilence = true;
     } else {
-      // Buffer underrun: worker was delayed or audio paused
+      // Buffer underrun: worker was delayed
       leftOut.fill(0);
       if (rightOut) rightOut.fill(0);
       this.consecutiveUnderruns++;
