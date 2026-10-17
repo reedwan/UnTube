@@ -2,6 +2,10 @@
 
 # UnTube
 
+<a href="https://chromewebstore.google.com/detail/dnpjndgmbnibmfemfmbkbkpgkflcmgdp">
+  <img src="assets/chrome-webstore-badge.png" alt="Available in the Chrome Web Store" height="50">
+</a>
+
 Real-time neural speech isolation extension for Chromium browsers that filters out background noise and music live using a custom-trained version of FastEnhancer-M running on WebAssembly SIMD.
 
 ---
@@ -11,30 +15,11 @@ Real-time neural speech isolation extension for Chromium browsers that filters o
 * **Custom Trained Model:** Runs a custom-trained version of FastEnhancer-M (`assets/fastenhancer_m.onnx`, 2.4 MB), optimized specifically for background music and accompaniment attenuation while preserving clean speech.
 * **Client-Side Inference:** Executes locally via WebAssembly SIMD using ONNX Runtime. Audio stays on the local device.
 * **Tab Audio Capture:** Captures tab audio via `chrome.tabCapture` across media players, embedded players, and cross-origin iframes.
-* **Low Latency & Zero Idle Overhead:** Average inference step runs in 1.48 ms per 6.67 ms hop (~22% real-time budget), and toggling off closes the offscreen document and terminates the worker, releasing all CPU threads and memory.
+* **Low Latency & Zero Idle Overhead:** Average inference step runs in ~1.15 ms per 6.67 ms hop (~17% real-time budget). During speech pauses, inference auto-sleeps at 0% CPU, and toggling off closes the offscreen document and terminates the worker, releasing all CPU threads and memory.
 
 ---
 
 ## Audio Pipeline
-
-```
-[Tab Capture (chrome.tabCapture)]
-             │
-             ▼
-[AudioWorklet: 128-sample Quanta] ◄── Elastic Ring Buffer ──► [Inference Worker: 320-sample Hops]
-             │                                                 (ONNX Runtime WebAssembly SIMD)
-             ▼
-[Soft Expander] (14 ms attack / 90 ms release)
-             │
-             ▼
-[Dual Biquad Low-Pass Filter] (4-pole Butterworth, 9.5 kHz cutoff)
-             │
-             ▼
-[Dynamics Compressor / Limiter] (-1 dBFS threshold, 20:1 ratio, 2 ms attack)
-             │
-             ▼
-[AudioContext.destination] (System Output)
-```
 
 1. **Capture:** 48 kHz stereo stream acquired via `chrome.tabCapture.getMediaStreamId()`.
 2. **Buffer Bridge:** Bridges WebAudio's 128-sample quanta to the neural network's 320-sample hops using a circular ring buffer.
@@ -55,14 +40,26 @@ UnTube runs a custom causal recurrent neural network based on FastEnhancer-M (`a
 * **Metrics:**
   * Music attenuation: 24.3 dB SDR improvement over mixture input.
   * Speech retention: +0.19 dB passthrough across vocal formants with zero onset degradation.
-  * Compute latency: ~1.48 ms per hop on modern x86-64 / Apple Silicon CPUs (~22% real-time budget utilization).
+  * Compute latency: ~1.15 ms per hop on modern x86-64 / Apple Silicon CPUs (~17% real-time budget utilization).
 
 ---
 
 ## Installation
 
+**Note:** Requires desktop Chromium (like Chrome, Edge, and Opera). Audio manipulation is not supported on mobile browsers.
+
+### Option 1: Chrome Web Store
+
+<a href="https://chromewebstore.google.com/detail/dnpjndgmbnibmfemfmbkbkpgkflcmgdp">
+  <img src="assets/chrome-webstore-badge.png" alt="Available in the Chrome Web Store" height="50">
+</a>
+
+Install directly from the [Chrome Web Store](https://chromewebstore.google.com/detail/dnpjndgmbnibmfemfmbkbkpgkflcmgdp).
+
+### Option 2: Install from Source
+
 1. Clone or download this repository.
-2. Open your browser's extensions page (e.g. `chrome://extensions`). [Requires desktop Chromium (like Chrome, Edge and Opera). Audio manipulation is not supported on mobile browsers.]
+2. Open your browser's extensions page (e.g. `chrome://extensions`).
 3. Enable **Developer mode** in the upper-right corner.
 4. Click **Load unpacked** and select the repository directory.
 5. Pin **UnTube** to the browser toolbar.
