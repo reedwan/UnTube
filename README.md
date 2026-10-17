@@ -2,10 +2,6 @@
 
 # UnTube
 
-<a href="https://chromewebstore.google.com/detail/dnpjndgmbnibmfemfmbkbkpgkflcmgdp">
-  <img src="assets/chrome-webstore-badge.png" alt="Available in the Chrome Web Store" height="50">
-</a>
-
 Real-time neural speech isolation extension for Chromium browsers that filters out background noise and music live using a custom-trained version of FastEnhancer-M running on WebAssembly SIMD.
 
 ---
@@ -51,7 +47,7 @@ UnTube runs a custom causal recurrent neural network based on FastEnhancer-M (`a
 ### Option 1: Chrome Web Store
 
 <a href="https://chromewebstore.google.com/detail/dnpjndgmbnibmfemfmbkbkpgkflcmgdp">
-  <img src="assets/chrome-webstore-badge.png" alt="Available in the Chrome Web Store" height="50">
+  <img src="assets/chrome-webstore-badge.png" alt="Available in the Chrome Web Store" height="70">
 </a>
 
 Install directly from the [Chrome Web Store](https://chromewebstore.google.com/detail/dnpjndgmbnibmfemfmbkbkpgkflcmgdp).
