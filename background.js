@@ -260,8 +260,8 @@ async function startTabCapture(tab) {
   updateTabBadge(tabId, 'STARTING');
 
   try {
-    // 1. Acquire tab stream token synchronously inside user gesture
-    const streamId = await new Promise((resolve, reject) => {
+    // 1. Synchronously initiate streamId token acquisition while user gesture is active
+    const streamIdPromise = new Promise((resolve, reject) => {
       chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message));
@@ -273,8 +273,8 @@ async function startTabCapture(tab) {
       });
     });
 
-    // 2. Ensure offscreen host is running
-    await ensureOffscreen();
+    // 2. Concurrently ensure offscreen host is running to receive the token
+    const [streamId] = await Promise.all([streamIdPromise, ensureOffscreen()]);
 
     // 3. Inject fullscreen helper (handles OS-level fullscreen during tab capture)
     chrome.scripting.executeScript({
@@ -340,9 +340,6 @@ async function toggleTabFilter(tab) {
   pendingToggles.add(tabId);
 
   try {
-    // Restore state from offscreen document if service worker woke from idle
-    await ensureSwState();
-
     if (capturedTabs.has(tabId) || startingTabs.has(tabId)) {
       UnTubeLogger.info('SW', `Toggle OFF for tab ${tabId}`);
       await stopTabCapture(tabId);

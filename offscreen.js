@@ -128,7 +128,12 @@ async function ensureEngine() {
     });
 
     // 2. Initialize 48kHz interactive AudioContext & load AudioWorklet module concurrently
-    audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: 'interactive' });
+    try {
+      audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: 'interactive' });
+    } catch (e) {
+      UnTubeLogger.warn('OFFSCREEN', 'Custom sample rate AudioContext failed, falling back to default device rate:', e);
+      audioCtx = new AudioContext({ latencyHint: 'interactive' });
+    }
     audioCtx.onstatechange = () => {
       UnTubeLogger.info('OFFSCREEN', `AudioContext state changed: ${audioCtx?.state}`);
       if (audioCtx?.state === 'suspended' && tabStreams.size > 0) {
@@ -277,24 +282,17 @@ async function startTabPipeline(streamId, tabId) {
   const gen = nextGeneration++;
   startingTabGenerations.set(tabId, gen);
 
+  let acquiredStream = null;
   try {
     if (tabStreams.has(tabId)) {
       stopTabPipeline(tabId, false);
       startingTabGenerations.set(tabId, gen);
     }
 
-    await ensureEngine();
-
-    // Abort if cancelled while awaiting engine initialization
-    if (startingTabGenerations.get(tabId) !== gen) {
-      if (tabStreams.size === 0 && startingTabGenerations.size === 0) {
-        shutdownEngine();
-      }
-      return;
-    }
-
-    // Acquire MediaStream from tabCapture streamId token
-    const stream = await navigator.mediaDevices.getUserMedia({
+    // 1. Immediately redeem the single-use streamId token via getUserMedia.
+    // Chrome expires streamId tokens after a few seconds, so it must be consumed
+    // immediately without waiting for neural engine compilation.
+    const streamPromise = navigator.mediaDevices.getUserMedia({
       audio: {
         mandatory: {
           chromeMediaSource: 'tab',
@@ -302,13 +300,21 @@ async function startTabPipeline(streamId, tabId) {
         }
       },
       video: false
+    }).then((s) => {
+      acquiredStream = s;
+      return s;
     });
 
-    // Abort and release stream if cancelled while awaiting getUserMedia
+    // 2. Concurrently ensure neural engine is warm and ready
+    const [stream] = await Promise.all([streamPromise, ensureEngine()]);
+
+    // Abort and release stream if cancelled while awaiting
     if (startingTabGenerations.get(tabId) !== gen || !audioCtx || !highpassNode) {
-      stream.getTracks().forEach(t => {
-        try { t.stop(); } catch (_) {}
-      });
+      if (acquiredStream) {
+        acquiredStream.getTracks().forEach((t) => {
+          try { t.stop(); } catch (_) {}
+        });
+      }
       if (tabStreams.size === 0 && startingTabGenerations.size === 0) {
         shutdownEngine();
       }
@@ -320,6 +326,11 @@ async function startTabPipeline(streamId, tabId) {
     // Connect tab audio stream source to the engine's high-pass filter input
     const sourceNode = audioCtx.createMediaStreamSource(stream);
     sourceNode.connect(highpassNode);
+
+    // Ensure AudioContext is actively running (crucial on Windows where AudioContext may start suspended)
+    if (audioCtx.state === 'suspended') {
+      await audioCtx.resume();
+    }
 
     // Auto-cleanup if the tab's audio track terminates
     stream.getAudioTracks().forEach(track => {
@@ -333,6 +344,11 @@ async function startTabPipeline(streamId, tabId) {
     UnTubeLogger.info('OFFSCREEN', `Tab ${tabId} connected. Active filtered tabs: ${tabStreams.size}`);
     sendTabStatus('active', tabId);
   } catch (err) {
+    if (acquiredStream) {
+      acquiredStream.getTracks().forEach((t) => {
+        try { t.stop(); } catch (_) {}
+      });
+    }
     const wasCurrent = startingTabGenerations.get(tabId) === gen;
     if (wasCurrent) {
       startingTabGenerations.delete(tabId);
@@ -490,3 +506,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 UnTubeLogger.info('OFFSCREEN', 'Offscreen audio host initialized.');
 sendEngineStatus('ready');
+
+// Pre-warm the neural engine in the background as soon as offscreen document loads
+ensureEngine().catch((err) => {
+  UnTubeLogger.warn('OFFSCREEN', 'Background engine pre-warm failed:', err);
+});

@@ -27,7 +27,7 @@ importScripts(ORT_BASE_URL + 'ort.wasm.min.js');
 
 // Configure ONNX Runtime Web for low-latency real-time audio inference
 ort.env.wasm.numThreads = 1;
-ort.env.wasm.simd = 'relaxed';
+ort.env.wasm.simd = true;
 ort.env.wasm.proxy = false;
 ort.env.wasm.wasmPaths = {
   mjs: ORT_BASE_URL + 'ort-wasm-simd-threaded.mjs',
